@@ -42,13 +42,15 @@ internal/
 
   database/
     database.go                  — conexão e execução de migrations
+    executor.go                  — interface Executor (*sql.DB e *sql.Tx)
     product.go                   — queries SQL para Product
     seller.go                    — queries SQL para Seller
     sellerproduct.go             — queries SQL para SellerProduct
 
     migrations/
       v1_create_salles.sql       — cria a tabela Seller
-      v2_drop_seller_columns.sql — recria SellerProduct com o novo schema
+      v2_drop_seller_columns.sql — cria SellerProduct com UNIQUE(seller_id, product_id)
+      v3_add_indexes.sql         — índices em Product e SellerProduct
 
   foundation/
     files/files.go               — leitura de arquivos .sql de um diretório
@@ -109,7 +111,8 @@ As migrations são arquivos `.sql` lidos automaticamente da pasta `internal/data
 | Arquivo | Descrição |
 |---|---|
 | `v1_create_salles.sql` | Cria a tabela `Seller` |
-| `v2_drop_seller_columns.sql` | Cria a tabela `SellerProduct` com o schema final |
+| `v2_drop_seller_columns.sql` | Cria `SellerProduct` com `UNIQUE(seller_id, product_id)` |
+| `v3_add_indexes.sql` | Índices em `Product(Name)` e `SellerProduct(seller_id, product_id, external_id)` |
 
 ---
 
@@ -123,14 +126,16 @@ As migrations são arquivos `.sql` lidos automaticamente da pasta `internal/data
       └─ substituir UUIDs inválidos por novos UUIDs gerados
 3. Deduplicar por external_id (manter primeira ocorrência)
 4. Carregar em memória:
-      └─ map[normalizedName]Product   (lookup O(1))
-      └─ map[normalizedName]Seller    (lookup O(1))
-      └─ map[sellerID:productID]bool  (lookup O(1))
-5. Para cada entrada:
+      └─ map[name|brand|category]Product  (lookup O(1))
+      └─ map[normalizedName]Seller        (lookup O(1))
+      └─ map[sellerID:productID]bool      (lookup O(1))
+5. Abrir transação SQL (BeginTx)
+6. Para cada entrada:
       a. Verificar se Seller existe → inserir se não existir
-      b. Verificar se Product existe (por nome normalizado) → inserir se não existir
+      b. Verificar se Product existe (por chave composta) → inserir se não existir
       c. Verificar se o vínculo SellerProduct já existe → inserir se não existir
-6. Exibir ConsolidationStats ao final
+7. Commit (ou Rollback em caso de erro)
+8. Exibir ConsolidationStats ao final
 ```
 
 A estratégia de carregar os três mapas antes do loop evita N+1 queries ao banco — toda decisão de inserção é tomada com lookups O(1) em memória.
@@ -176,6 +181,27 @@ Os testes de `processEntries` usam um banco SQLite em memória (`:memory:`) para
 
 ---
 
+## Débitos Técnicos Conhecidos
+
+O projeto possui limitações documentadas em [`docs/tech-debt.md`](docs/tech-debt.md). Abaixo um resumo por criticidade:
+
+| Problema | Categoria | Criticidade |
+|---|---|---|
+| Carga total em memória — sem paginação ou batch | Técnica | Alta |
+| Sem `UNIQUE` em `SellerProduct(external_id)` | Técnica | Média |
+| JSON carregado inteiro em memória (`os.ReadFile`) | Técnica | Média |
+| Variável global `database.DB` | Técnica | Média |
+| Dedup por `external_id` quebrado após substituição de UUID inválido | Técnica | Média |
+| Dados de produtos existentes nunca são atualizados | Negócio | Média |
+| Sem relatório de entradas rejeitadas | Negócio | Média |
+| `processEntries` não é pura apesar do comentário sugerir | Técnica | Baixa |
+| Migrations sem controle de versão (`schema_migrations`) | Técnica | Baixa agora / Alta no futuro |
+| Caminho do JSON hardcoded | Negócio | Baixa |
+
+Consulte [`docs/tech-debt.md`](docs/tech-debt.md) para a descrição completa, arquivos afetados e soluções sugeridas para cada item.
+
+---
+
 ## Sugestões de Melhorias Futuras
 
 ### Funcionalidades
@@ -183,13 +209,10 @@ Os testes de `processEntries` usam um banco SQLite em memória (`:memory:`) para
 - **Deduplicação por similaridade semântica** — além de normalizar espaços, aplicar distância de Levenshtein ou embeddings para identificar produtos semanticamente iguais com nomes muito distintos.
 - **Suporte a múltiplos arquivos de entrada** — processar um diretório inteiro de JSONs de diferentes vendedores em vez de um único arquivo fixo.
 - **API HTTP** — expor endpoints REST para receber catálogos via upload e consultar o estado do catálogo consolidado.
-- **Relatório de consolidação** — gerar um arquivo de saída com os produtos inseridos, duplicatas encontradas e vínculos criados por execução.
+- **Relatório de consolidação** — gerar um arquivo de saída com os produtos inseridos, duplicatas encontradas, entradas rejeitadas e vínculos criados por execução.
 
 ### Qualidade e Operação
 
-- **Rastreamento de migrations com `schema_migrations`** — adicionar controle de quais migrations já foram aplicadas para suportar migrations destrutivas com segurança em produção.
-- **Transação por lote** — envolver `processEntries` em uma única transação SQL para garantir atomicidade: ou tudo é persistido ou nada é.
 - **Logging estruturado** — substituir `log.Printf` por `slog` (Go 1.21+) com campos estruturados (`zerolog` ou `zap` como alternativas), facilitando integração com sistemas de observabilidade.
-- **Configuração por variáveis de ambiente** — externalizar caminhos do banco e do arquivo JSON via `os.Getenv` ou biblioteca como `github.com/caarlos0/env`.
 - **Testes de integração** — adicionar testes end-to-end que executam `Consolidate` completo contra um banco `:memory:` com dados pré-populados e verificam o estado final.
 - **Lint e CI** — configurar `golangci-lint` e um pipeline de CI (GitHub Actions) com build, testes e lint automatizados.
